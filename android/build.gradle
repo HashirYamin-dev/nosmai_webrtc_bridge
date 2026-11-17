@@ -1,0 +1,61 @@
+group = "com.nosmai.webrtc_bridge"
+version = "0.1.0"
+
+buildscript {
+    ext.kotlin_version = "2.1.0"
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.9.1")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version")
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: "com.android.library"
+apply plugin: "kotlin-android"
+
+android {
+    namespace = "com.nosmai.webrtc_bridge"
+    compileSdk = 36
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = JavaVersion.VERSION_17.toString() }
+    sourceSets { main.java.srcDirs += "src/main/kotlin" }
+    defaultConfig { minSdk = 24 }
+
+    dependencies {
+        // org.webrtc.* — flutter_webrtc bundles the same build at runtime, so compileOnly.
+        compileOnly("io.github.webrtc-sdk:android:144.7559.09")
+        // com.cloudwebrtc.webrtc.* (FlutterWebRTCPlugin, LocalVideoTrack) — provided by flutter_webrtc.
+        compileOnly(project(":flutter_webrtc"))
+
+        // Nosmai classes, compileOnly: the HOST app bundles the AAR (never duplicated here).
+        // TextureFrameCallback is invoked from native via CallVoidMethod, so it must be a real
+        // implemented interface; a reflection Proxy would abort the process. Hence a real
+        // compile-time dependency, resolved from the host's app/libs through flatDir.
+        // The AAR name is discovered (e.g. nosmai-sdk-3.0.7.aar) so version bumps need no edit here.
+        def libsDir = new File("${rootProject.projectDir}/app/libs")
+        def aar = libsDir.exists() ? libsDir.listFiles({ f -> f.name.startsWith("nosmai") && f.name.endsWith(".aar") } as FileFilter)?.sort()?.reverse()?.find { true } : null
+        if (aar != null) {
+            compileOnly(name: aar.name.replaceAll(/\.aar$/, ""), ext: "aar")
+        } else {
+            logger.warn("nosmai_webrtc_bridge: no nosmai*.aar found in ${libsDir}. Put nosmai-sdk-<version>.aar in the host app's android/app/libs/.")
+        }
+    }
+}
+
+repositories {
+    flatDir { dirs "${rootProject.projectDir}/app/libs" }
+}
