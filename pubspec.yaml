@@ -1,5 +1,5 @@
 name: nosmai_webrtc_bridge
-description: "Publish a Nosmai-processed camera feed over raw WebRTC (flutter_webrtc) from Flutter. GPU-texture path on Android, with frame counters and stream mirror control."
+description: "Publish a Nosmai-processed camera feed over raw WebRTC (flutter_webrtc) from Flutter on Android and iOS, with frame counters and stream mirror control."
 version: 0.1.0
 publish_to: 'none'
 
@@ -24,4 +24,6 @@ flutter:
     platforms:
       android:
         package: com.nosmai.webrtc_bridge
+        pluginClass: NosmaiWebRtcBridgePlugin
+      ios:
         pluginClass: NosmaiWebRtcBridgePlugin

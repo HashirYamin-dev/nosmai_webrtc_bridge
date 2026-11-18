@@ -67,7 +67,7 @@ class NosmaiFrameStats {
   final int height;
 }
 
-/// Nosmai <-> flutter_webrtc bridge (Android).
+/// Nosmai <-> flutter_webrtc bridge (Android and iOS).
 ///
 /// Exposes Nosmai's processed GPU texture as a normal flutter_webrtc video track. Your app owns the
 /// `RTCPeerConnection`, signalling, ICE/TURN, audio and reconnects.

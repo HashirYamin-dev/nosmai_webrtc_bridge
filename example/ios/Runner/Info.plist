@@ -66,5 +66,16 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Camera is used by Nosmai to apply filters to the live stream.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Microphone is used for the WebRTC audio track.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connects to the local signalling server for WebRTC tests.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

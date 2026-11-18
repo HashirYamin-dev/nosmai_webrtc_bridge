@@ -1,85 +1,134 @@
 # nosmai_webrtc_bridge
 
-Publish a **Nosmai-processed camera feed** over **raw WebRTC** (`flutter_webrtc`) from Flutter.
-Nosmai's processed GPU texture becomes a normal `flutter_webrtc` video track. Your app owns the
-`RTCPeerConnection`, signalling, ICE/TURN, audio and reconnects.
-
-Android only for now (minSdk 24, arm64-v8a). Tested against Nosmai SDK **3.0.7**.
+Stream a **Nosmai-processed camera feed** (filters, beauty, AR effects) over **WebRTC** from Flutter,
+on **Android and iOS**, with one Dart API.
 
 ```
-Camera -> Nosmai (filters + AR) --+--> on-screen preview   (NosmaiCameraPreview, nosmai_camera_sdk)
-                                  +--> this bridge --> flutter_webrtc track --> your RTCPeerConnection
+Camera -> Nosmai (effects) --+--> NosmaiCameraPreview (on screen)
+                             +--> this bridge --> flutter_webrtc video track --> your RTCPeerConnection
 ```
 
-## The model: Nosmai owns the camera, WebRTC only transports
+The bridge only turns Nosmai's output into a `flutter_webrtc` track. **Your app** owns the peer
+connection, signalling, STUN/TURN, audio and reconnects.
 
-- Mount `NosmaiCameraPreview` and do **not** call `getUserMedia` for video. A second camera means a
-  second Nosmai pipeline on the one GL worker and a large fps loss.
-- `registerShareContext()` **must be awaited before** `NosmaiFlutter.initialize()`. The EGL share
-  handle is consumed when Nosmai's GL context is created; a later call is ignored and the remote
-  sees black video with no error.
+## Requirements
 
-## API
+| | Android | iOS |
+|---|---|---|
+| OS | minSdk 24, arm64-v8a | iOS 15+ |
+| Nosmai | AAR 3.0.7 in `android/app/libs/` | `NosmaiCameraSDK` pod 3.0.x (pulled automatically) |
+| WebRTC | `flutter_webrtc: 1.6.0` (pinned) | same |
+| Licence | bound to `applicationId` | bound to bundle id |
 
-```dart
-await NosmaiWebRtcBridge.registerShareContext();      // before Nosmai init
-await NosmaiFlutter.initialize(licenseKey);
-
-await NosmaiWebRtcBridge.setMirror(false);            // default; see Mirror below
-final v = await NosmaiWebRtcBridge.createVideoTrack();    // optional: width/height/fps downscale
-await pc.addTrack(v.track, v.stream);                 // your own peer connection + signalling
-
-NosmaiWebRtcBridge.frameStats().listen((s) => ...);   // Nosmai output fps, pushed fps, drops, blit ms
-await NosmaiWebRtcBridge.stopStreaming();             // BEFORE pc.close()
-```
-
-| Method | Purpose |
-|---|---|
-| `registerShareContext()` | Join flutter_webrtc's EGL group. Before Nosmai init. |
-| `createVideoTrack({width,height,fps})` | Returns `NosmaiVideoTrack(stream, track)`. 0 = no downscale. |
-| `stopStreaming()` / `isStreaming()` | Teardown / state. |
-| `setMirror(bool)` | Horizontal flip of the **stream**. See below. |
-| `setRotation(deg)` | Rotation metadata. Default 0 is correct on Android. |
-| `getCounters()` / `frameStats()` | Raw counters / per-second rates (Nosmai output fps etc.). |
-
-### Mirror
-
-`setMirror(bool)` flips the **stream** horizontally (default false). Nosmai's own mirror override only
-affects its on-screen preview; the streamed texture is always non-mirrored. With `nosmai_camera_sdk`
-the preview matches the raw stream (verified on a OnePlus CPH2515 with a second phone as viewer), so the
-default needs no flip. Call `setMirror(true)` only if your host mirrors the preview (e.g. native
-`NosmaiSDK.MIRROR_ON`). Always confirm with a real viewer using an asymmetric scene. The example has a
-"Stream mirror" button for this comparison. Back camera was not tested.
-
-## Install
+## 1. Install
 
 ```yaml
 dependencies:
   nosmai_webrtc_bridge:
-    path: ../nosmai_webrtc_bridge
-  flutter_webrtc: 1.6.0
+    git:
+      url: https://github.com/HashirYamin-dev/nosmai_webrtc_bridge.git
   nosmai_camera_sdk: ^3.0.6
+  flutter_webrtc: 1.6.0        # keep exactly this version
+  permission_handler: ^11.3.1
 ```
 
-The host app bundles the Nosmai AAR (the plugin only declares it `compileOnly`). Put it at
-`android/app/libs/nosmai-release.aar` (the file name `nosmai_camera_sdk` expects) and add:
+## 2. Android setup
 
-```kotlin
-// android/app/build.gradle.kts
-dependencies { implementation(files("libs/nosmai-release.aar")) }
+1. Copy the Nosmai AAR to `android/app/libs/nosmai-release.aar`.
+2. `android/app/build.gradle.kts`:
+   ```kotlin
+   android { defaultConfig { minSdk = 24; ndk { abiFilters += listOf("arm64-v8a") } } }
+   dependencies { implementation(files("libs/nosmai-release.aar")) }
+   ```
+3. `applicationId` = the id your Nosmai licence is issued for.
+4. `AndroidManifest.xml`: `CAMERA`, `RECORD_AUDIO`, `INTERNET`, `MODIFY_AUDIO_SETTINGS`.
+
+## 3. iOS setup
+
+1. `ios/Podfile`: `platform :ios, '15.0'`, and in `post_install` enable the permissions
+   `permission_handler` needs (without this it reports "denied" and never prompts):
+   ```ruby
+   target.build_configurations.each do |config|
+     config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] ||= ['$(inherited)']
+     config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] += ['PERMISSION_CAMERA=1', 'PERMISSION_MICROPHONE=1']
+   end
+   ```
+2. `Info.plist`: `NSCameraUsageDescription`, `NSMicrophoneUsageDescription`,
+   `NSLocalNetworkUsageDescription` (for a LAN signalling server).
+3. Bundle id = the id your Nosmai licence is issued for. Set your own signing team in Xcode.
+
+## 4. Go live (sender)
+
+```dart
+// a) Once, at startup. ORDER MATTERS: share context BEFORE Nosmai init (no-op on iOS).
+await NosmaiWebRtcBridge.registerShareContext();
+await NosmaiFlutter.initialize(licenseKey);
+
+// b) Show the camera: put NosmaiCameraPreview() in your widget tree.
+//    Do NOT call getUserMedia for video; Nosmai owns the camera.
+
+// c) Go live
+final v = await NosmaiWebRtcBridge.createVideoTrack();       // 720x1280 by default
+final pc = await createPeerConnection({'iceServers': [/* STUN + TURN */]});
+await pc.addTrack(v.track, v.stream);
+final mic = await navigator.mediaDevices.getUserMedia({'audio': true, 'video': false});
+for (final t in mic.getAudioTracks()) { await pc.addTrack(t, mic); }
+// ...create the offer and exchange SDP/ICE over your own signalling...
+
+// d) Stop: bridge FIRST, then the peer connection
+await NosmaiWebRtcBridge.stopStreaming();
+await pc.close();
 ```
 
-Set `applicationId` to the id your Nosmai licence key is bound to. Permissions CAMERA, RECORD_AUDIO and
-INTERNET are the host's responsibility.
+**Viewer:** a normal `flutter_webrtc` receiver (`onTrack` → `RTCVideoView`), or any browser. It needs
+no Nosmai SDK and no licence. See `example/lib/viewer_page.dart`.
 
-## Example
+**Effects while live:** call Nosmai as usual (`applySkinSmoothing`, `applyEffect`, `removeAllFilters`,
+…). The stream carries whatever Nosmai renders, so viewers see the change on the next frame.
+See `example/lib/effects_sheet.dart`.
 
-`example/` is a sender: Nosmai preview, a plain WebSocket signalling client, an `RTCPeerConnection`, a
-top banner `SEND x fps | VIEWER GETS y fps`, and Nosmai output fps. It talks to the signalling server and
-viewer in `web_rtc_testapp/server` (`node server.js`); a viewer reports its fps back over signalling.
+## API
 
-## Notes
+| Method | What it does |
+|---|---|
+| `registerShareContext()` | Android: joins WebRTC's EGL group. **Await before `NosmaiFlutter.initialize`.** iOS: no-op. |
+| `createVideoTrack({width, height, fps})` | Returns `(stream, track)`. Optional downscale; 0 = Nosmai's size. |
+| `stopStreaming()` / `isStreaming()` | Teardown / state. Call stop before `pc.close()`. |
+| `setMirror(bool)` | Flips the **stream** only (default off). |
+| `setRotation(deg)` | Rotation metadata. Keep 0 (frames are already upright). |
+| `frameStats()` / `getCounters()` | Nosmai fps, pushed fps, dropped frames. |
 
-- `flutter_webrtc` is pinned to 1.6.0 because the bridge wraps the native track with
-  `MediaStreamTrackNative` (an implementation import). Re-verify when upgrading.
-- The Android `compileOnly` WebRTC dependency matches flutter_webrtc 1.6.0 (`webrtc-sdk 144.7559.09`).
+## Rules that save debugging time
+
+- Android: `registerShareContext()` after Nosmai init → remote video is **black, no error**.
+- Never open a second camera (`getUserMedia` video) → large fps loss.
+- Keep `flutter_webrtc` at **1.6.0**; the bridge uses one of its internal classes. Re-test before upgrading.
+- Production needs a **TURN** server. STUN alone fails on many mobile networks.
+- Never commit the licence key. Pass it with `--dart-define=NOSMAI_LICENSE=...`.
+
+## Run the example
+
+```bash
+# 1. Signalling server + browser viewer (Mac and phones on the same Wi-Fi)
+cd example/server && npm install && node server.js      # prints ws://<mac-ip>:8080
+
+# 2. App (Android or iOS)
+cd example
+flutter run --release \
+  --dart-define=NOSMAI_LICENSE=<your-key> \
+  --dart-define=SIGNAL_URL=ws://<mac-ip>:8080 \
+  --dart-define=ROOM=qa
+```
+
+In the app: one phone taps **Open sender** → **Go Live** (**Effects** button for filters); another phone
+taps **Open viewer**, or open `http://localhost:8080/viewer.html?room=qa` on the Mac.
+Before building, change the example's `applicationId` / bundle id and iOS signing team to your own.
+`AUTO_LIVE=true` skips the taps (for scripted tests).
+
+## Status
+
+- **iOS:** verified on iPhone X (sender → Mac viewer): 720x1280 at 30 fps, hardware H.264, 0 dropped
+  frames, 0 packet loss over a 3-minute run.
+- **Android:** builds and runs; streaming verified earlier on OnePlus CPH2515 with a second phone as viewer.
+- **Not yet verified:** effects as seen by the viewer, mirror on iOS, back camera, repeated stop/go-live,
+  long runs, TURN/mobile networks.

@@ -9,7 +9,25 @@ import 'package:nosmai_webrtc_bridge/nosmai_webrtc_bridge.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'effects_sheet.dart';
+import 'viewer_page.dart';
+
 void main() => runApp(const ExampleApp());
+
+/// Connects the signalling WebSocket, retrying for ~30 s. On iOS the first LAN connection fails
+/// with "No route to host" while the Local Network permission prompt is pending, or if it was denied.
+Future<WebSocket> connectSignalling(String url, {void Function(int attempt, Object error)? onRetry}) async {
+  for (var attempt = 1;; attempt++) {
+    try {
+      return await WebSocket.connect(url).timeout(const Duration(seconds: 5));
+    } catch (e) {
+      if (attempt >= 15) rethrow;
+      debugPrint('[example] signalling attempt $attempt failed: $e');
+      onRetry?.call(attempt, e);
+      await Future<void>.delayed(const Duration(seconds: 2));
+    }
+  }
+}
 
 class ExampleApp extends StatelessWidget {
   const ExampleApp({super.key});
@@ -31,20 +49,37 @@ class SetupPage extends StatefulWidget {
 }
 
 class _SetupPageState extends State<SetupPage> {
-  final _server = TextEditingController(text: 'ws://192.168.1.2:8080');
-  final _room = TextEditingController(text: 'qa');
-  final _license = TextEditingController();
+  final _server = TextEditingController(text: const String.fromEnvironment('SIGNAL_URL', defaultValue: 'ws://192.168.1.2:8080'));
+  final _room = TextEditingController(text: const String.fromEnvironment('ROOM', defaultValue: 'qa'));
+  final _license = TextEditingController(text: const String.fromEnvironment('NOSMAI_LICENSE'));
 
   @override
   void initState() {
     super.initState();
     SharedPreferences.getInstance().then((p) {
       setState(() {
-        _server.text = p.getString('server') ?? _server.text;
-        _room.text = p.getString('room') ?? _room.text;
-        _license.text = p.getString('license') ?? '';
+        _server.text = const bool.hasEnvironment('SIGNAL_URL') ? _server.text : (p.getString('server') ?? _server.text);
+        _room.text = const bool.hasEnvironment('ROOM') ? _room.text : (p.getString('room') ?? _room.text);
+        _license.text = _license.text.isNotEmpty ? _license.text : (p.getString('license') ?? '');
       });
+      // Test automation: skip the setup screen.
+      if (const bool.fromEnvironment('AUTO_LIVE') && mounted) {
+        const String.fromEnvironment('ROLE', defaultValue: 'sender') == 'viewer' ? _openViewer() : _open();
+      }
     });
+  }
+
+  Future<void> _openViewer() async {
+    final p = await SharedPreferences.getInstance();
+    await p.setString('server', _server.text.trim());
+    await p.setString('room', _room.text.trim());
+    if (!mounted) return;
+    Navigator.of(context).push(MaterialPageRoute(
+      builder: (_) => ViewerPage(
+        serverUrl: _server.text.trim(),
+        room: _room.text.trim().isEmpty ? 'qa' : _room.text.trim(),
+      ),
+    ));
   }
 
   Future<void> _open() async {
@@ -83,7 +118,13 @@ class _SetupPageState extends State<SetupPage> {
           FilledButton.icon(
             onPressed: _open,
             icon: const Icon(Icons.videocam),
-            label: const Text('Open sender'),
+            label: const Text('Open sender (go live)'),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton.icon(
+            onPressed: _openViewer,
+            icon: const Icon(Icons.visibility),
+            label: const Text('Open viewer (watch live, no licence needed)'),
           ),
         ]),
       );
@@ -150,6 +191,11 @@ class _SenderPageState extends State<SenderPage> {
         _ready = true;
         _status = 'Nosmai ready. Open the viewer, then tap Go Live.';
       });
+      // Test automation (--dart-define=AUTO_LIVE=true).
+      if (const bool.fromEnvironment('AUTO_LIVE')) {
+        await Future<void>.delayed(const Duration(seconds: 1));
+        if (mounted && !_live) await _goLive();
+      }
     } catch (e) {
       setState(() => _status = 'Nosmai init failed: $e');
     }
@@ -158,6 +204,13 @@ class _SenderPageState extends State<SenderPage> {
   // ---- live ---------------------------------------------------------------------------------
   Future<void> _goLive() async {
     try {
+      // Signalling first: if the server is unreachable, fail before minting a track.
+      setState(() => _status = 'Connecting to ${widget.serverUrl}...');
+      final ws = await connectSignalling(widget.serverUrl, onRetry: (n, e) {
+        if (mounted) setState(() => _status = 'Signalling retry $n: $e');
+      });
+      _ws = ws;
+
       setState(() => _status = 'Creating track...');
       // The viewer must see what the sender sees on screen; see _streamMirror above.
       await NosmaiWebRtcBridge.setMirror(_streamMirror);
@@ -186,8 +239,7 @@ class _SenderPageState extends State<SenderPage> {
         await pc.addTrack(t, _audioStream!);
       }
 
-      final ws = await WebSocket.connect(widget.serverUrl);
-      _ws = ws;
+      // The socket buffers anything received before this listen.
       ws.listen(_onSignal, onDone: () {
         if (mounted && _live) setState(() => _status = 'Signalling closed');
       });
@@ -201,9 +253,10 @@ class _SenderPageState extends State<SenderPage> {
         if (mounted) setState(() => _nosmaiFps = s.nosmaiOutputFps);
       });
       _statsTimer = Timer.periodic(const Duration(seconds: 1), (_) => _pollStats());
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('[example/sender] Go Live failed: $e\n$st');
       setState(() => _status = 'Go Live failed: $e');
-      await _stopLive();
+      await _stopLive(keepStatus: true);
     }
   }
 
@@ -243,10 +296,25 @@ class _SenderPageState extends State<SenderPage> {
     }
   }
 
+  // Static so a hot reload into a live session initializes it (new instance fields would not be).
+  static int _pollN = 0;
+
   Future<void> _pollStats() async {
     final pc = _pc;
     if (pc == null) return;
+    final n = ++_pollN;
+    if (n % 5 == 0) debugPrint('[example/stats] poll $n: getStats...');
     final reports = await pc.getStats();
+    if (n % 5 == 0) {
+      final c = await NosmaiWebRtcBridge.getCounters();
+      final out = reports.where((r) => r.type == 'outbound-rtp').map((r) =>
+          '${r.values['kind'] ?? r.values['mediaType']}:${r.values['framesPerSecond'] ?? '-'}fps,'
+          '${r.values['frameWidth'] ?? '-'}x${r.values['frameHeight'] ?? '-'},'
+          'sent=${r.values['framesSent'] ?? r.values['packetsSent']},enc=${r.values['encoderImplementation'] ?? '-'}');
+      debugPrint('[example/stats] bridge nosmai=${c?.nosmaiFrames} pushed=${c?.pushedFrames} '
+          'dropped=${c?.droppedFrames} ${c?.width}x${c?.height} | nosmaiFps=${_nosmaiFps.toStringAsFixed(1)} '
+          'viewer=${_viewerFps?.toStringAsFixed(1)} | ${out.join(' ; ')}');
+    }
     for (final r in reports) {
       if (r.type == 'outbound-rtp' && r.values['kind'] == 'video') {
         final v = r.values;
@@ -260,6 +328,12 @@ class _SenderPageState extends State<SenderPage> {
         _prevBytes = bytes;
         _prevAt = now;
         if (!mounted) return;
+        if (now.second % 5 == 0) {
+          debugPrint('[example/stats] send=${(v['framesPerSecond'] as num?)?.toStringAsFixed(1)}fps '
+              'nosmai=${_nosmaiFps.toStringAsFixed(1)}fps viewer=${_viewerFps?.toStringAsFixed(1)}fps '
+              '${v['frameWidth']}x${v['frameHeight']} ${kbps?.toStringAsFixed(0)}kbps '
+              'enc=${v['encoderImplementation']} limit=${v['qualityLimitationReason']} mirror=$_streamMirror');
+        }
         setState(() {
           _sendFps = (v['framesPerSecond'] as num?)?.toDouble() ?? 0;
           _sendDetail = '${v['frameWidth'] ?? '-'}x${v['frameHeight'] ?? '-'}  '
@@ -270,7 +344,7 @@ class _SenderPageState extends State<SenderPage> {
     }
   }
 
-  Future<void> _stopLive() async {
+  Future<void> _stopLive({bool keepStatus = false}) async {
     _statsTimer?.cancel();
     await _frameSub?.cancel();
     // Order matters: stop the Nosmai producer first, then the peer connection and socket.
@@ -290,7 +364,7 @@ class _SenderPageState extends State<SenderPage> {
         _live = false;
         _viewerFps = null;
         _sendFps = 0;
-        _status = 'Stopped';
+        if (!keepStatus) _status = 'Stopped';
       });
     }
   }
@@ -310,8 +384,14 @@ class _SenderPageState extends State<SenderPage> {
   }
 
   // ---- UI -----------------------------------------------------------------------------------
+  String? _lastLogged;
+
   @override
   Widget build(BuildContext context) {
+    if (_lastLogged != _status) {
+      _lastLogged = _status;
+      debugPrint('[example/sender] $_status');
+    }
     final banner = _live
         ? 'SEND ${_sendFps.toStringAsFixed(1)} fps | VIEWER GETS ${_viewerFps?.toStringAsFixed(1) ?? '-'} fps'
         : 'Not live';
@@ -364,6 +444,21 @@ class _SenderPageState extends State<SenderPage> {
                   ),
                   const SizedBox(width: 8),
                   Expanded(
+                    child: FilledButton.tonal(
+                      onPressed: _ready
+                          ? () => showModalBottomSheet<void>(
+                                context: context,
+                                isScrollControlled: true,
+                                builder: (_) => const EffectsSheet(),
+                              )
+                          : null,
+                      child: const Text('Effects'),
+                    ),
+                  ),
+                ]),
+                const SizedBox(height: 6),
+                Row(children: [
+                  Expanded(
                     child: OutlinedButton(
                       onPressed: _ready ? _switchCamera : null,
                       child: Text(_front ? 'Front' : 'Back'),
@@ -379,7 +474,7 @@ class _SenderPageState extends State<SenderPage> {
                               setState(() {});
                             }
                           : null,
-                      child: Text('Stream mirror ${_streamMirror ? 'ON' : 'OFF'}'),
+                      child: Text('Mirror ${_streamMirror ? 'ON' : 'OFF'}'),
                     ),
                   ),
                   const SizedBox(width: 8),
